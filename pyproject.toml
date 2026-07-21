@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fleetlet"
+version = "0.1.0"
+description = "Modal/Ray-style serverless functions and actors on smolvm microVMs — define workers in code, run them in hardware-isolated VMs with fork-based warm pools."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Logan Grasby" }]
+keywords = ["smolvm", "microvm", "serverless", "workers", "sandbox", "modal", "ray"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+    "cloudpickle>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/LoganGrasby/fleetlet"
+Repository = "https://github.com/LoganGrasby/fleetlet"
+Issues = "https://github.com/LoganGrasby/fleetlet/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+fleetlet = "fleetlet.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fleetlet"]
