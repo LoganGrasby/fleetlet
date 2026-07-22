@@ -53,3 +53,11 @@ class RemoteError(FleetletError):
 
 class AppNotRunning(FleetletError):
     """A remote call was made outside of `with app.run():`."""
+
+
+class FrozenActorError(FleetletError):
+    """A method was called on an actor whose VM is frozen.
+
+    ``actor.fork()`` freezes the actor's VM as the immutable branch
+    template — call methods on a branch, or ``fork()`` again for more
+    branches at the frozen state."""

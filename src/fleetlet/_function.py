@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Iterator, TYPE_CHECKING
 import cloudpickle
 
 from ._proto import blob_id
-from .errors import ConfigError
+from .errors import ConfigError, FrozenActorError
 from .image import Image
 
 if TYPE_CHECKING:
@@ -116,6 +116,9 @@ class Options:
     timeout: float | None = None
     retries: int = 0
     name: str | None = None
+    # Actors only: start the worker VM as a fork base so the live instance
+    # can be branched with instance.fork(). Local target only.
+    forkable: bool = False
 
     def normalized_volumes(self) -> list[str]:
         if not self.volumes:
@@ -236,6 +239,50 @@ class ClsInstance:
         ctor_hash = hashlib.sha256(self._ctor_blob).hexdigest()[:4]
         self._slug = f"{cls._slug}-{ctor_hash}"
         self._local_instance: Any | None = None
+        self._branch_seq = 0
+        self._frozen = False
+        self._branch_of: str | None = None  # parent slug, set on branch handles
+
+    def fork(self, n: int | None = None) -> "ClsInstance | list[ClsInstance]":
+        """Branch this live actor: snapshot its VM and return new actors
+        whose in-memory state diverges from this exact moment. `fork()`
+        returns one branch; `fork(n)` returns a list of n.
+
+        Forking FREEZES this actor — smolvm allows one live branch point
+        per VM, so the snapshot becomes an immutable template. After it,
+        method calls on this handle raise FrozenActorError, while further
+        fork() calls mint more branches at the frozen state. Branches are
+        full actors, except they cannot fork() again (a clone cannot be
+        re-forked). Needs @app.cls(forkable=True); local target only.
+        """
+        count = 1 if n is None else n
+        if count < 1:
+            raise ConfigError("fork(n) needs n >= 1")
+        if self._branch_of is not None:
+            raise ConfigError(
+                "branches cannot fork() again — smolvm supports one live "
+                "branch point per VM lineage (a clone cannot be re-forked). "
+                "Fork the original actor for more branches."
+            )
+        if not self._cls._options.forkable:
+            raise ConfigError(
+                f"actor '{self._cls.__name__}' is not forkable — declare it "
+                "with @app.cls(forkable=True) to enable fork()"
+            )
+        slugs = []
+        for _ in range(count):
+            slugs.append(f"{self._slug}-b{self._branch_seq}")
+            self._branch_seq += 1
+        self._cls._app._fork_instance_pools(self, slugs)
+        self._frozen = True
+        branches = [self._as_branch(slug) for slug in slugs]
+        return branches[0] if n is None else branches
+
+    def _as_branch(self, slug: str) -> "ClsInstance":
+        branch = ClsInstance(self._cls, *self._ctor_args)
+        branch._slug = slug
+        branch._branch_of = self._slug
+        return branch
 
     def __getattr__(self, name: str) -> "BoundMethod":
         if name.startswith("_"):
@@ -291,6 +338,11 @@ class BoundMethod:
     def _submit(self, args: tuple, kwargs: dict,
                 timeout: float | None = None, size_hint: int | None = None) -> cf.Future:
         instance = self._instance
+        if instance._frozen:
+            raise FrozenActorError(
+                f"actor '{instance._slug}' is frozen — fork() snapshotted "
+                "its VM; call methods on a branch instead"
+            )
         pool = instance._cls._app._pool_for_instance(instance)
         spec = {"kind": "self", "qualname": self._method}
         return pool.submit(

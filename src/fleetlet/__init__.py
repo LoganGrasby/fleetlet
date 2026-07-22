@@ -19,6 +19,7 @@ from .app import App
 from .errors import (
     AppNotRunning,
     ConfigError,
+    FrozenActorError,
     RemoteError,
     FleetletError,
     SmolvmError,
@@ -40,5 +41,6 @@ __all__ = [
     "WorkerError",
     "RemoteError",
     "AppNotRunning",
+    "FrozenActorError",
     "__version__",
 ]

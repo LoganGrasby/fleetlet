@@ -233,6 +233,10 @@ def test_machine_prefix_collision_proof():
     assert not a.startswith(b) and not b.startswith(a)  # teardown sweeps by prefix
     assert a == PoolConfig(fn_slug="resize-images-small", **kw).machine_prefix()
     assert a.startswith("flt-")
+    # An 11-char name truncates onto its own hyphen ("userservice-343f"[:12]);
+    # smolvm rejects consecutive hyphens in machine names.
+    c = PoolConfig(fn_slug="userservice-343f", **kw).machine_prefix()
+    assert "--" not in c
 
 
 def test_pool_mode_resolution():
@@ -785,12 +789,13 @@ def test_cli_fleet_machines_app_matches_deployment():
     assert len(cli._fleet_machines(FakeBackend())) == 4
 
 
-def _bare_pool(**backend_attrs):
+def _bare_pool(cfg_kwargs=None, **backend_attrs):
     import types
 
     from fleetlet._pool import Pool
 
-    cfg = PoolConfig(app_name="a", fn_slug="f", run_id="r", image=Image.default())
+    cfg = PoolConfig(app_name="a", fn_slug="f", run_id="r", image=Image.default(),
+                     **(cfg_kwargs or {}))
     backend = types.SimpleNamespace(target="local", list_machines=lambda: [],
                                     **backend_attrs)
     return Pool(cfg, backend=backend)
@@ -825,3 +830,233 @@ def test_pool_shutdown_fails_pending_tasks():
     # A queued-but-never-served task must fail fast, not hang its waiter.
     with pytest.raises(WorkerError, match="shut down"):
         task.future.result(timeout=1)
+
+
+# ---------------------------------------------------------------------------
+# actor fork
+# ---------------------------------------------------------------------------
+
+def test_forkable_config_guards():
+    import types
+
+    from fleetlet._pool import Pool
+    from fleetlet.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="forkable"):
+        PoolConfig(app_name="a", fn_slug="f", run_id="r", image=Image.default(),
+                   forkable=True, size=3).validate()
+    with pytest.raises(ConfigError, match="forkable"):
+        PoolConfig(app_name="a", fn_slug="f", run_id="r", image=Image.default(),
+                   forkable=True, mode="fork").validate()
+    cfg = PoolConfig(app_name="a", fn_slug="f", run_id="r", image=Image.default(),
+                     forkable=True)
+    backend = types.SimpleNamespace(target="cloud", list_machines=lambda: [])
+    with pytest.raises(ConfigError, match="local-only"):
+        Pool(cfg, backend=backend)
+
+
+def _serving_pool(worker, **kwargs):
+    """A pool with one injected worker and a live serve thread."""
+    pool = _bare_pool(**kwargs)
+    pool._started = True
+    pool.workers.append(worker)
+    thread = threading.Thread(target=pool._serve, args=(worker,), daemon=True)
+    pool.threads.append(thread)
+    thread.start()
+    return pool, thread
+
+
+def test_pool_fork_branches_freezes_then_replays_template():
+    from fleetlet._pool import _SENTINEL, Worker
+    from fleetlet.errors import FrozenActorError
+
+    forks, closes = [], []
+    worker = Worker("src-w0")
+    worker.close = lambda: closes.append(1)
+    pool, thread = _serving_pool(
+        worker,
+        cfg_kwargs={"forkable": True},
+        fork=lambda golden, name, ports=None, share_weights=False:
+            forks.append((golden, name)),
+        status=lambda name: {"state": "frozen"},
+    )
+
+    out = pool.fork_branches(["m-b0-w0", "m-b1-w0"])
+    assert forks == [("src-w0", "m-b0-w0"), ("src-w0", "m-b1-w0")]
+    assert [name for name, _ in out] == ["m-b0-w0", "m-b1-w0"]
+    assert all(isinstance(port, int) for _, port in out)
+    assert closes == [1]  # quiesced exactly once
+    assert pool._frozen_template == "src-w0"
+
+    # frozen: calls fail fast, but more branches replay the template
+    with pytest.raises(FrozenActorError, match="frozen"):
+        pool.submit({}, None, (), {}, tag="t")
+    pool.fork_branches(["m-b2-w0"])
+    assert forks[-1] == ("src-w0", "m-b2-w0")
+    assert closes == [1]  # no second quiesce against a frozen template
+
+    pool.tasks.put(_SENTINEL)
+    thread.join(timeout=2)
+
+
+def test_pool_fork_failure_before_freeze_reattaches():
+    from fleetlet._pool import _SENTINEL, Worker
+    from fleetlet.errors import SmolvmError
+
+    def boom(golden, name, ports=None, share_weights=False):
+        raise SmolvmError(["fork"], 1, "engine says no")
+
+    reattached = []
+    worker = Worker("src-w0")
+    worker.close = lambda: None
+    worker.wait_ready = lambda deadline: reattached.append(deadline)
+    pool, thread = _serving_pool(
+        worker, cfg_kwargs={"forkable": True},
+        fork=boom, status=lambda name: {"state": "running"},
+    )
+
+    with pytest.raises(SmolvmError, match="engine says no"):
+        pool.fork_branches(["m-b0-w0"])
+    assert reattached  # reconnected — the actor stays serviceable
+    assert pool._defunct is None and pool._frozen_template is None
+
+    pool.tasks.put(_SENTINEL)
+    thread.join(timeout=2)
+
+
+def test_pool_fork_failure_after_freeze_marks_frozen():
+    from fleetlet._pool import _SENTINEL, Worker
+    from fleetlet.errors import FrozenActorError, SmolvmError
+
+    def boom(golden, name, ports=None, share_weights=False):
+        raise SmolvmError(["fork"], 1, "clone refused")
+
+    reattached = []
+    worker = Worker("src-w0")
+    worker.close = lambda: None
+    worker.wait_ready = lambda deadline: reattached.append(deadline)
+    pool, thread = _serving_pool(
+        worker, cfg_kwargs={"forkable": True},
+        fork=boom,
+        # the engine freezes the source before validating the clone
+        status=lambda name: {"state": "frozen"},
+    )
+
+    with pytest.raises(SmolvmError, match="clone refused"):
+        pool.fork_branches(["m-b0-w0"])
+    assert not reattached  # a frozen source can't be reattached
+    assert pool._frozen_template == "src-w0"
+    with pytest.raises(FrozenActorError):
+        pool.submit({}, None, (), {}, tag="t")
+
+    pool.tasks.put(_SENTINEL)
+    thread.join(timeout=2)
+
+
+def test_branch_pool_death_is_terminal():
+    from fleetlet._pool import Task, Worker
+    from fleetlet.errors import WorkerError
+
+    pool = _bare_pool()
+    pool._adopted = True
+    pool._started = True
+    worker = Worker("br-w0")
+    pool.workers.append(worker)
+    task = Task(spec={}, blob=None, args_blob=b"", timeout=None, retries=3, tag="t")
+    task.future.set_running_or_notify_cancel()
+
+    got = pool._handle_transport_failure(worker, task, WorkerError("vm gone"))
+    assert got is worker  # never replaced — the branched state died with it
+    with pytest.raises(WorkerError, match="vm gone"):
+        task.future.result(timeout=1)
+    with pytest.raises(WorkerError, match="unrecoverable"):
+        pool.submit({}, None, (), {}, tag="t2")
+
+
+def test_actor_fork_handles_and_freeze(monkeypatch):
+    import fleetlet
+    from fleetlet.errors import ConfigError, FrozenActorError
+
+    app = fleetlet.App("t", sync_project=False)
+
+    @app.cls(forkable=True)
+    class Counter:
+        def bump(self):
+            pass
+
+    counter = Counter()
+    calls = []
+    monkeypatch.setattr(app, "_fork_instance_pools",
+                        lambda inst, slugs: calls.append(slugs) or [])
+
+    branch = counter.fork()
+    assert branch._branch_of == counter._slug
+    assert branch._slug == f"{counter._slug}-b0"
+    assert counter._frozen
+    with pytest.raises(FrozenActorError, match="frozen"):
+        counter.bump.remote()
+    with pytest.raises(ConfigError, match="branches cannot fork"):
+        branch.fork()
+
+    pair = counter.fork(2)  # replays the frozen state; sequence continues
+    assert [b._slug for b in pair] == [f"{counter._slug}-b1", f"{counter._slug}-b2"]
+    assert calls == [[f"{counter._slug}-b0"],
+                     [f"{counter._slug}-b1", f"{counter._slug}-b2"]]
+
+
+def test_actor_fork_requires_forkable_and_valid_n():
+    import fleetlet
+    from fleetlet.errors import ConfigError
+
+    app = fleetlet.App("t", sync_project=False)
+
+    @app.cls
+    class Plain:
+        def m(self):
+            pass
+
+    @app.cls(forkable=True)
+    class Forky:
+        def m(self):
+            pass
+
+    with pytest.raises(ConfigError, match="forkable=True"):
+        Plain().fork()
+    with pytest.raises(ConfigError, match="n >= 1"):
+        Forky().fork(0)
+
+
+def test_pool_adopt_round_trip_against_real_runner():
+    """Adoption must deliver a working pool around an already-live runner:
+    connect, (cached) setup, then calls flow — without any machine bringup."""
+    import time as _time
+    import types
+
+    from fleetlet._pool import Pool
+    from fleetlet._proto import blob_id as _blob_id
+    from fleetlet._runner import Runner
+
+    runner = Runner(project_root=None)
+    runner.log = open(os.devnull, "w")
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    threading.Thread(target=runner.serve, args=("127.0.0.1", port),
+                     daemon=True).start()
+    _time.sleep(0.3)
+
+    cfg = PoolConfig(app_name="a", fn_slug="f-b0", run_id="r",
+                     image=Image.default(), setup_id="sid1")
+    backend = types.SimpleNamespace(
+        target="local", list_machines=lambda: [],
+        stop=lambda name: True, delete=lambda name: True,
+        status=lambda name: None,  # teardown verifies deletion via status
+    )
+    pool = Pool.adopt(cfg, backend, "br-w0", port)
+
+    blob = cloudpickle.dumps(lambda x: x * 3)
+    spec = {"kind": "blob", "blob_id": _blob_id(blob)}
+    future = pool.submit(spec, blob, (14,), {}, tag="t")
+    assert future.result(timeout=10) == 42
+    pool.shutdown()

@@ -47,12 +47,25 @@ from ._proto import (
     recv_frame,
     send_frame,
 )
-from .errors import CloudError, ConfigError, RemoteError, SmolvmError, WorkerError
+from .errors import (
+    CloudError,
+    ConfigError,
+    FleetletError,
+    FrozenActorError,
+    RemoteError,
+    SmolvmError,
+    WorkerError,
+)
 from .image import Image
 
 CONTROL_TIMEOUT = 60.0
 COLD_CONNECT_DEADLINE = 120.0
 FORK_CONNECT_DEADLINE = 30.0
+# Quiesce gap between closing the host connection and forking: the guest
+# runner must see the EOF and re-enter accept() before the snapshot, or the
+# clone inherits a half-open connection its runner is still blocked on.
+FORK_SETTLE = 0.3
+FORK_OP_TIMEOUT = 120.0
 READ_TIMEOUT = 60.0          # max gap between bytes once a reply starts arriving
 LIVENESS_POLL = 5.0          # how often to probe a quiet worker for death
 LIVENESS_PROBE_TIMEOUT = 20.0
@@ -144,6 +157,9 @@ class PoolConfig:
     setup_id: str = ""
     call_timeout: float | None = None
     retries: int = 0
+    # Start the (single) worker as a fork base so the live actor can be
+    # branched later with instance.fork().
+    forkable: bool = False
 
     def resolved_mode(self) -> str:
         if self.mode != "auto":
@@ -154,10 +170,14 @@ class PoolConfig:
         # The readable segments are truncated, so two long slugs can share
         # them; the digest keeps prefixes unique — teardown sweeps machines
         # by prefix, so a collision would delete another pool's workers.
+        # rstrip: a truncation can land on a slug's own hyphen, and smolvm
+        # rejects names with consecutive hyphens.
         ident = hashlib.sha256(
             f"{self.app_name}/{self.fn_slug}".encode()
         ).hexdigest()[:6]
-        return f"flt-{self.app_name[:12]}-{self.fn_slug[:12]}-{ident}-{self.run_id}"
+        app = self.app_name[:12].rstrip("-")
+        fn = self.fn_slug[:12].rstrip("-")
+        return f"flt-{app}-{fn}-{ident}-{self.run_id}"
 
     def validate(self) -> None:
         if self.image.needs_network and self.net is not True:
@@ -169,6 +189,12 @@ class PoolConfig:
         if self.resolved_mode() == "fork" and self.volumes:
             log(f"warning: fork pool '{self.fn_slug}' uses volumes — volume mounts "
                 "on fork clones are untested; prefer cold pools for volume workloads")
+        if self.forkable and (self.size > 1 or self.resolved_mode() != "cold"):
+            raise ConfigError(
+                f"'{self.fn_slug}' is forkable — a forkable actor is ONE machine "
+                "whose live state can branch, so workers>1 / pool='fork' don't "
+                "apply. Fork it at runtime instead: branches = actor.fork(n)."
+            )
 
 
 @dataclass
@@ -183,6 +209,19 @@ class Task:
 
 
 _SENTINEL = Task(spec={}, blob=None, args_blob=b"", timeout=None, retries=0, tag="")
+
+
+@dataclass
+class _ForkOp:
+    """Control message asking the serve thread to fork the worker's VM.
+
+    Riding the task queue is what makes forking safe: the serve thread is
+    the only consumer, so by the time it picks this up the worker is
+    guaranteed idle — no call is mid-flight in the VM being snapshotted.
+    """
+
+    machine_names: list[str]
+    future: cf.Future = field(default_factory=cf.Future)
 
 
 class Worker:
@@ -616,6 +655,12 @@ class Pool:
             # ingress URL, so their calls ride the exec API.
             log(f"pool '{cfg.fn_slug}': cloud fork pool — clones keep the "
                 "golden's warm state; calls go over the exec relay")
+        if cfg.forkable and self.backend.target == "cloud":
+            raise ConfigError(
+                f"'{cfg.fn_slug}': forkable actors are local-only for now — "
+                "cloud actor forks need forkable-at-create plus relay "
+                "transport for the actor itself, which isn't wired up yet"
+            )
         # Second auth layer for cloud workers, on top of the tenant-authed
         # ingress: a per-pool secret the runner requires on every op request.
         self._runner_token = secrets.token_hex(16)
@@ -628,12 +673,27 @@ class Pool:
         self._started = False
         self._closed = False
         self._py_warned = False
+        # An adopted pool wraps ONE pre-existing worker (a fork branch): it
+        # never brings machines up, scales, or replaces its worker — the
+        # branched state is unreproducible, so a dead worker is a dead pool.
+        self._adopted = False
+        # Set when the pool can no longer serve calls (actor frozen by fork,
+        # or a branch worker died): (exception class, message).
+        self._defunct: tuple[type[FleetletError], str] | None = None
+        # Once the first fork freezes the worker's VM, its name lives here;
+        # later forks clone this immutable template.
+        self._frozen_template: str | None = None
 
     # ------------------------------------------------------------ lifecycle
 
     def ensure_started(self, size: int | None = None) -> None:
         with self._lock:
             target = max(self.cfg.size, size or 0, 1)
+            if self.cfg.forkable or self._adopted:
+                # A forkable actor (or a fork branch) IS its one machine's
+                # state — size hints from .map() must not add stateless
+                # replicas beside it.
+                target = 1
             if not self._started:
                 self._started = True
                 started_at = time.monotonic()
@@ -822,7 +882,7 @@ class Pool:
         else:
             port = alloc_port()
             self.backend.create(self._machine_spec(name, port))
-            self.backend.start(name)
+            self.backend.start(name, forkable=self.cfg.forkable)
             self._stage_and_launch(name)
             worker = self._finish_worker(
                 SocketWorker(name, port, self.backend), COLD_CONNECT_DEADLINE)
@@ -861,6 +921,7 @@ class Pool:
                args: tuple, kwargs: dict, *, tag: str,
                timeout: float | None = None, size_hint: int | None = None) -> cf.Future:
         self.ensure_started(size_hint)
+        self._check_serviceable()
         task = Task(
             spec=spec,
             blob=blob,
@@ -872,11 +933,23 @@ class Pool:
         self.tasks.put(task)
         return task.future
 
+    def _check_serviceable(self) -> None:
+        if self._defunct is not None:
+            exc_cls, msg = self._defunct
+            raise exc_cls(msg)
+
     def _serve(self, worker: Worker) -> None:
         while True:
             task = self.tasks.get()
             if task is _SENTINEL:
                 return
+            if isinstance(task, _ForkOp):
+                self._execute_fork(worker, task)
+                continue
+            if self._defunct is not None:
+                exc_cls, msg = self._defunct
+                _complete(task.future.set_exception, exc_cls(msg))
+                continue
             # Mark RUNNING so a user cancel() can no longer race the delivery
             # below. A re-queued retry task is already RUNNING — skip it.
             if not task.future.running():
@@ -903,6 +976,19 @@ class Pool:
             # drop it so no queued task can read a stale frame as its answer.
             worker.close()
             _complete(task.future.set_exception, exc)
+            return worker
+        if self._adopted:
+            # A branch worker holds forked state that exists nowhere else —
+            # a replacement would cold-boot a fresh instance and silently
+            # impersonate the lost branch. Fail everything instead.
+            worker.close()
+            self._defunct = (
+                WorkerError,
+                f"branch '{self.cfg.fn_slug}' lost its VM ({exc}) — branched "
+                "state is unrecoverable, so the branch cannot be replaced",
+            )
+            _complete(task.future.set_exception, exc)
+            self._fail_queued_tasks(self._defunct[1])
             return worker
         log(f"{worker.name} failed ({exc}); replacing")
         try:
@@ -954,6 +1040,117 @@ class Pool:
         for _ in range(sentinels):
             self.tasks.put(_SENTINEL)
 
+    # ------------------------------------------------------------ actor fork
+
+    def fork_branches(self, machine_names: list[str]) -> list[tuple[str, int]]:
+        """Fork the live actor's VM into one machine per name.
+
+        Runs on the serve thread (via the task queue) so it serializes with
+        in-flight calls. The FIRST fork freezes the source VM as the
+        immutable branch template — the pool goes defunct for calls but
+        keeps accepting fork ops, which replay the frozen state.
+
+        Returns (machine_name, host_port) pairs; the machines are live but
+        not yet connected — adopt them with Pool.adopt().
+        """
+        if not self.cfg.forkable:
+            raise ConfigError(
+                f"'{self.cfg.fn_slug}' was not declared forkable — "
+                "pass forkable=True to @app.cls to enable fork()"
+            )
+        if self._closed:
+            raise WorkerError(f"pool '{self.cfg.fn_slug}' is shut down")
+        self.ensure_started()
+        op = _ForkOp(list(machine_names))
+        self.tasks.put(op)
+        try:
+            return op.future.result(timeout=FORK_OP_TIMEOUT)
+        except cf.TimeoutError:
+            raise WorkerError(
+                f"fork of '{self.cfg.fn_slug}' timed out after "
+                f"{FORK_OP_TIMEOUT:.0f}s"
+            ) from None
+
+    def _execute_fork(self, worker: Worker, op: _ForkOp) -> None:
+        """Serve-thread side of fork_branches. The worker is idle here by
+        construction — this thread is its only caller."""
+        forked: list[tuple[str, int]] = []
+        try:
+            if self._frozen_template is None:
+                # Quiesce: EOF our connection so the guest runner re-enters
+                # accept() before the snapshot — a clone whose runner is
+                # still blocked on an inherited half-open connection is dead
+                # on arrival (TSI never delivers it a close).
+                worker.close()
+                time.sleep(FORK_SETTLE)
+            source = self._frozen_template or worker.name
+            for name in op.machine_names:
+                port = alloc_port()
+                self.backend.fork(source, name,
+                                  ports=[(port, GUEST_PORT)],
+                                  share_weights=False)
+                forked.append((name, port))
+            if self._frozen_template is None:
+                self._mark_frozen(source)
+            _complete(op.future.set_result, forked)
+        except BaseException as exc:
+            for name, _ in forked:
+                self._teardown_machine(name)
+            if self._frozen_template is None:
+                if self._source_froze(worker.name):
+                    # The engine freezes the source before validating the
+                    # clone — a failed fork can still consume the freeze.
+                    self._mark_frozen(worker.name)
+                else:
+                    try:
+                        worker.wait_ready(10.0)
+                    except Exception as reattach_exc:
+                        log(f"could not reattach {worker.name} after failed "
+                            f"fork: {reattach_exc}")
+            _complete(op.future.set_exception, exc)
+
+    def _mark_frozen(self, template: str) -> None:
+        self._frozen_template = template
+        self._defunct = (
+            FrozenActorError,
+            f"actor '{self.cfg.fn_slug}' is frozen — fork() snapshotted its "
+            "VM as the branch template. Call methods on a branch, or fork() "
+            "again for more branches at the frozen state.",
+        )
+
+    def _source_froze(self, name: str) -> bool:
+        try:
+            st = self.backend.status(name)
+        except (SmolvmError, CloudError):
+            return False
+        return bool(st) and st.get("state") == "frozen"
+
+    @classmethod
+    def adopt(cls, cfg: PoolConfig, backend: Backend, machine_name: str,
+              port: int, sent_blobs: set[str] | None = None) -> "Pool":
+        """Build a pool around one already-live branch machine (fork output).
+
+        The runner inside inherited the parent's warm state; the setup op is
+        a server-side no-op (same setup_id → cached), so the branched state
+        survives adoption untouched.
+        """
+        pool = cls(cfg, backend)
+        pool._adopted = True
+        worker = SocketWorker(machine_name, port, backend)
+        worker.sent_blobs = set(sent_blobs or ())
+        pool._finish_worker(worker, FORK_CONNECT_DEADLINE)
+        with pool._lock:
+            pool._started = True
+            pool._worker_seq = 1
+            pool.workers.append(worker)
+            thread = threading.Thread(
+                target=pool._serve, args=(worker,),
+                name=f"fleetlet-{worker.name}", daemon=True,
+            )
+            pool.threads.append(thread)
+            thread.start()
+        return pool
+
     # ------------------------------------------------------------ teardown
 
     def shutdown(self) -> None:
@@ -989,17 +1186,25 @@ class Pool:
         if clones or golden in names or self.golden:
             with cf.ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(self._teardown_machine, clones))
-            self._teardown_machine(golden)
+            if self.golden or golden in names:
+                # Cold pools have no golden — don't "clean up" a machine
+                # that never existed (and then report it as leaked).
+                self._teardown_machine(golden)
             log(f"pool '{self.cfg.fn_slug}' torn down "
                 f"({len(clones)} worker(s){' + golden' if self.golden else ''})")
 
     def _teardown_machine(self, name: str) -> None:
         try:
             self.backend.stop(name)
-            if not self.backend.delete(name):
-                # stop/delete report failure as False, not an exception —
-                # say so instead of letting the machine leak silently.
-                log(f"cleanup of {name} incomplete — run `fleetlet clean`")
+            # `machine delete` can claim success while the machine survives
+            # in `stopped` (seen under concurrent teardowns) — trust only a
+            # gone machine, and give stragglers one settle+retry.
+            for _ in range(2):
+                self.backend.delete(name)
+                if self.backend.status(name) is None:
+                    return
+                time.sleep(0.5)
+            log(f"cleanup of {name} incomplete — run `fleetlet clean`")
         except SmolvmError as exc:  # pragma: no cover — best-effort cleanup
             log(f"cleanup of {name} failed: {exc}")
 

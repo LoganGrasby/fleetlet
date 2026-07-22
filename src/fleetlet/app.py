@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import concurrent.futures as cf
+import dataclasses
 import hashlib
 import os
 import secrets
@@ -83,7 +84,8 @@ class App:
     def cls(self, klass: type | None = None, **kwargs: Any):
         """Register a class as a remote actor. One instance lives per worker;
         methods marked @fleetlet.enter run at worker boot (in the golden for
-        fork pools — clones inherit the warmed state)."""
+        fork pools — clones inherit the warmed state). With forkable=True the
+        live instance can be branched at runtime via instance.fork()."""
         options = Options(**kwargs)
 
         def wrap(k: type) -> Cls:
@@ -198,10 +200,53 @@ class App:
                 setup_id=setup_id,
                 call_timeout=options.timeout,
                 retries=options.retries,
+                forkable=options.forkable,
             )
             pool = Pool(cfg, self.backend)
             self._pools[slug] = pool
             return pool
+
+    def _fork_instance_pools(self, instance: ClsInstance,
+                             branch_slugs: list[str]) -> list[Pool]:
+        """Fork a live actor's VM into one adopted pool per branch slug.
+
+        The parent pool serializes the fork against in-flight calls and
+        freezes on first use; each branch machine is then adopted into its
+        own single-worker pool, registered so app teardown sweeps it."""
+        pool = self._pool_for_instance(instance)
+        branch_cfgs = [
+            dataclasses.replace(pool.cfg, fn_slug=slug, forkable=False)
+            for slug in branch_slugs
+        ]
+        forked = pool.fork_branches(
+            [f"{cfg.machine_prefix()}-w0" for cfg in branch_cfgs]
+        )
+        sent_blobs = set(pool.workers[0].sent_blobs) if pool.workers else set()
+        adopted: list[Pool] = []
+        failures: list[Exception] = []
+        with cf.ThreadPoolExecutor(max_workers=len(forked)) as executor:
+            futures = {
+                executor.submit(Pool.adopt, cfg, self.backend, name, port,
+                                sent_blobs): name
+                for cfg, (name, port) in zip(branch_cfgs, forked)
+            }
+            for future, name in futures.items():
+                try:
+                    adopted.append(future.result())
+                except Exception as exc:
+                    failures.append(exc)
+                    # No pool owns this machine yet, so no teardown sweep
+                    # will ever find it — reclaim it here.
+                    self.backend.stop(name)
+                    self.backend.delete(name)
+        with self._pool_lock:
+            for branch_pool in adopted:
+                self._pools[branch_pool.cfg.fn_slug] = branch_pool
+        if failures:
+            for extra in failures[1:]:
+                log(f"additional branch adoption failure: {extra}")
+            raise failures[0]
+        return adopted
 
     @property
     def backend(self) -> Backend:

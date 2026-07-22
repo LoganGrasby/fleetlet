@@ -21,7 +21,8 @@ if __name__ == "__main__":
 
 Every worker is a real virtual machine (libkrun/KVM/Hypervisor.framework), not a container:
 untrusted code gets a hypervisor boundary, its own kernel, CoW disks, and no network unless
-you grant it.
+you grant it. And because the engine can fork a *live* VM, a running actor can be
+[branched mid-life](#branching-live-actors-instancefork) into divergent copies in ~0.1s.
 
 ## Why fork pools
 
@@ -78,6 +79,44 @@ with app.run():
     emb = Embedder("all-MiniLM-L6-v2")
     vectors = list(emb.embed.map(documents))
 ```
+
+## Branching live actors (`instance.fork()`)
+
+Fork pools clone a worker *template* built at boot. `fork()` goes further: it branches a
+**running** actor — interpreter, heap, threads, everything — mid-life, in ~0.1s per branch:
+
+```python
+@app.cls(forkable=True)
+class Session:
+    @fleetlet.enter
+    def boot(self):
+        self.df = load_huge_dataset()      # expensive, happens once
+
+    def prep(self): ...                    # mutate live state
+    def train(self, lr: float): ...
+
+with app.run():
+    sess = Session()
+    sess.prep.remote()                     # state evolves in the VM
+    branches = sess.fork(3)                # 3 divergent copies of this exact moment
+    losses = [b.train.remote(lr) for b, lr in zip(branches, [0.3, 0.01, 0.0005])]
+```
+
+Every branch starts from the same in-memory moment and then diverges — best-of-N
+exploration, speculative "try it in a copy of reality" execution, per-test fixture
+isolation — without ever rebuilding the expensive state.
+
+Semantics (they mirror the engine exactly):
+
+- **Forking freezes the parent.** smolvm supports one live branch point per VM: the first
+  fork snapshots the parent as an immutable template. Method calls on it then raise
+  `FrozenActorError`, while further `fork()` calls mint more branches *at the frozen state*
+  (want the mainline to continue? take an extra branch as the new mainline).
+- **Branches are full actors** — `.remote/.spawn/.map`, own VM, own divergent state — but
+  they can't `fork()` again (a clone can't be re-forked), and a dead branch is not
+  replaced: its state exists nowhere else.
+- `fork()` serializes with in-flight calls through the actor's queue, so the snapshot never
+  catches a call mid-flight. Local target only for now.
 
 ## Images
 
@@ -147,6 +186,7 @@ Exceptions raised in the guest are re-raised on the host (with the remote traceb
     gpu=False,            # Vulkan (virtio-gpu)
     cuda=False,           # host NVIDIA GPU over vsock (see smolvm docs)
     share_weights=False,  # fork pools + CUDA: one VRAM copy of frozen weights
+    forkable=False,       # actors only: enable instance.fork() (local target)
 )
 ```
 
@@ -303,6 +343,8 @@ fleetlet doctor                      # verify smolvm / python / cloud auth
   (`pack --from-vm` snapshot caching is the planned fix).
 - CUDA/`share_weights` options are plumbed but only exercised on Linux hosts with the
   smolvm CUDA daemon; `--gpu` (Vulkan) is untested from fleetlet.
+- `instance.fork()` is local-only, and one branch point deep: forking freezes the parent,
+  and branches can't re-fork (engine constraints — cloud actor forks are on the roadmap).
 
 ## Examples
 
@@ -314,6 +356,9 @@ python examples/04_isolation.py  # hostile code stays contained, workers auto-re
 python examples/05_http_service.py  # functions as HTTP endpoints (schema'd + validated)
 python examples/06_cloud.py         # same code on smol cloud machines (+ deploy)
 python examples/07_embeddings.py    # real model (bge-small ONNX) as a service; --bench
+python examples/08_branching.py     # fork a LIVE actor: one warm state, divergent futures
+python examples/09_database.py      # seed postgres once, fork the running DB per test
+python examples/10_speculative.py   # try 3 risky migrations in forked realities, keep 1
 ```
 
 ## License
